@@ -446,6 +446,14 @@ section {
 .logs .notice, dialog .notice { color: var(--good); }
 .discord-line .ok { color: #7c8cff; font-weight: 600; } /* Discord blurple */
 .log-paste { display: flex; gap: 6px; margin-top: 10px; }
+/* "Keys in this log" after pasting a link: every key and why it was or wasn't saved */
+.log-check { margin-top: 10px; padding: 8px 10px; border-radius: 6px; background: rgb(0 0 0 / .25); border: 1px solid var(--border); font-size: 12px; }
+.log-check-head { display: flex; justify-content: space-between; margin-bottom: 6px; }
+.log-check table { width: 100%; border-collapse: collapse; }
+.log-check td { padding: 3px 8px 3px 0; border-top: 1px solid var(--border); vertical-align: top; }
+.log-check .lvl { color: var(--accent); }
+.log-check .ok { color: var(--good); }
+.log-check .bad { color: var(--error); }
 .log-paste input { flex: 1; min-width: 0; font-size: 12px; }
 .log-paste button { font-size: 12px; padding: 4px 12px; }
 .day-tabs { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-top: 10px; }

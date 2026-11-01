@@ -932,10 +932,28 @@ async function announceRun(r) {
   });
 }
 
-// ---------- the same key logged by several of us ----------
+// For the log check: what happened to one key in a report, and why.
+function explainRun(run, saved) {
+  const f = run.fight;
+  const id = runId(run);
+  const teamCount = run.players.filter((p) => p.team).length;
+  const row = {
+    startedAt: Math.round(run.report.startTime + f.startTime),
+    dungeon: f.name, level: f.keystoneLevel, ...fightSummary(f),
+    team: teamCount,
+  };
+  if (f.inProgress) return { ...row, status: "⏳ Still being played, imported once it's finished" };
+  if (teamCount < MIN_TEAM_IN_RUN) return { ...row, status: `Only ${teamCount} of the roster in it (needs ${MIN_TEAM_IN_RUN})` };
+  if (saved.some((r) => r.id === id)) return { ...row, status: "✅ Saved" };
+  const other = saved.find((r) => sameKey(r, runKey(run)));
+  if (other) {
+    const where = other.code === run.report.code ? `fight ${other.fightId} in this log` : "another log";
+    return { ...row, status: `Same key as ${where}, which is more complete` };
+  }
+  return { ...row, status: "Not saved" };
+}
 
-// Uploads of one key from different loggers start within seconds of each other.
-const SAME_KEY_WITHIN_MINUTES = 15;
+// ---------- the same key logged by several of us ----------
 
 // What identifies a key, for a run straight from a report (before it's saved).
 function runKey({ report, fight, players }) {
@@ -943,14 +961,19 @@ function runKey({ report, fight, players }) {
     dungeon: fight.name,
     level: fight.keystoneLevel,
     startedAt: Math.round(report.startTime + fight.startTime),
+    timeMs: Math.round(fight.endTime - fight.startTime),
     team: players.filter((p) => p.team).map((p) => p.name),
   };
 }
 
-// Same dungeon and level, started at about the same time, with MIN_TEAM_IN_RUN of the same team in it.
+// The same key: same dungeon and level, MIN_TEAM_IN_RUN of the same team, and played at the same
+// time. Copies from several loggers, or a cut-off fight next to the finished one, always overlap
+// in time; two separate keys never do, even back to back in the same dungeon at the same level.
 function sameKey(a, b) {
   if (normName(a.dungeon) !== normName(b.dungeon) || a.level !== b.level) return false;
-  if (Math.abs(a.startedAt - b.startedAt) > SAME_KEY_WITHIN_MINUTES * 60000) return false;
+  const aEnd = a.startedAt + Math.max(a.timeMs ?? 0, 60000);
+  const bEnd = b.startedAt + Math.max(b.timeMs ?? 0, 60000);
+  if (!(a.startedAt < bEnd && b.startedAt < aEnd)) return false;
   const team = new Set((a.team ?? []).map(normName));
   return (b.team ?? []).filter((n) => team.has(normName(n))).length >= MIN_TEAM_IN_RUN;
 }
@@ -1005,8 +1028,18 @@ async function refreshLogs({ code } = {}) {
       return (f.keystoneBonus ?? 0) !== saved.bonus || !!f.kill !== saved.kill
         || Math.round(f.keystoneTime ?? f.endTime - f.startTime) !== saved.timeMs;
     };
-    const fresh = found.filter(changed).slice(0, 20);
+    // If several versions of a key are in this batch (e.g. a cut-off fight and the finished one),
+    // only the most complete one goes on, so the cut-off one is never saved or posted first.
+    const fresh = [];
+    for (const run of found.filter(changed)) {
+      const key = { ...runKey(run), ...fightSummary(run.fight) };
+      const i = fresh.findIndex((r) => sameKey({ ...runKey(r), ...fightSummary(r.fight) }, key));
+      if (i < 0) fresh.push(run);
+      else if (isMoreComplete(key, fightSummary(fresh[i].fight))) fresh[i] = run;
+    }
+    fresh.splice(20);
     const savedNow = [];
+    const replacedIds = new Set();
     let imported = 0;
     for (const [i, run] of fresh.entries()) {
       // The same key can show up more than once: in each logger's report, or as a cut-off fight
@@ -1027,19 +1060,26 @@ async function refreshLogs({ code } = {}) {
       await setDoc(doc(db, "runs", runId(run)), data);
       if (replaces) {
         await deleteDoc(doc(db, "runs", replaces));
+        replacedIds.add(replaces);
         const j = savedNow.findIndex((r) => r.id === replaces);
         if (j >= 0) savedNow.splice(j, 1);
       }
       savedNow.push({ id: runId(run), ...data });
       imported += 1;
       try {
-        await announceRun(data);
+        // Keys without an end time (cut off while live logging, or abandoned) are saved, not posted.
+        if (run.fight.keystoneTime != null) await announceRun(data);
       } catch (e) {
         console.error("Discord:", e);
         logs.error = `Saved the run, but couldn't post it to Discord: ${e.message}`;
       }
     }
     if (!code) await setDoc(doc(db, "meta", "logs"), { lastRefresh: serverTimestamp(), byName: myDisplayName() });
+    // A pasted link also shows every key in that log and why it was or wasn't saved.
+    if (code) {
+      const saved = [...state.runs, ...savedNow].filter((r) => !replacedIds.has(r.id));
+      logs.check = { code, rows: reports.flatMap((r) => wcl.keystoneFights(r, chars)).map((run) => explainRun(run, saved)) };
+    }
     logs.notice = code && !found.length
       ? `No Mythic+ runs with ${MIN_TEAM_IN_RUN}+ of the team in that log.`
       : imported ? `Added or updated ${imported} run${imported === 1 ? "" : "s"}.` : "No new runs.";
@@ -1143,6 +1183,20 @@ function renderLogs() {
       <input name="link" placeholder="Paste a Warcraft Logs link (optional)" autocomplete="off">
       <button class="secondary" ${logs.busy ? "disabled" : ""}>Add</button>
     </form>` : ""}
+    ${logs.check ? `<div class="log-check">
+      <div class="log-check-head"><b>Keys in this log</b>
+        <a href="#" data-logs="close-check">close</a></div>
+      ${logs.check.rows.length ? `<table>${logs.check.rows.map((c) => {
+        const when = new Date(c.startedAt);
+        const res = runResult(c);
+        return `<tr>
+          <td class="muted">${when.toLocaleDateString(undefined, { weekday: "short" })} ${when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</td>
+          <td><b class="lvl">+${c.level}</b> ${esc(c.dungeon)}</td>
+          <td class="${res.ok ? "ok" : "bad"}">${res.text}</td>
+          <td>${esc(c.status)}</td>
+        </tr>`;
+      }).join("")}</table>` : `<p class="muted small">No Mythic+ keys in this log.</p>`}
+    </div>` : ""}
     <div class="day-tabs" role="tablist">${DAYS.map((name, i) => `
       <button role="tab" class="${i === day ? "on" : ""} ${i === todayIdx ? "today" : ""} ${byDay[i].length ? "" : "empty"}"
         aria-selected="${i === day}" data-day="${i}">${name}${byDay[i].length ? `<span class="count">${byDay[i].length}</span>` : ""}</button>`).join("")}
@@ -1183,6 +1237,7 @@ $("#logs").addEventListener("click", (e) => {
     e.preventDefault();
     if (action === "connect") wcl.connect();
     if (action === "discord") openDiscordDialog();
+    if (action === "close-check") { state.logs.check = null; renderLogs(); }
     if (action === "refresh") refreshLogs();
     if (action === "disconnect" && confirm("Disconnect Warcraft Logs in this browser? The saved runs stay.")) {
       wcl.disconnect();

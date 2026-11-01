@@ -178,13 +178,12 @@ export async function fetchReports(codes) {
   return reports;
 }
 
-// Mythic+ runs in a report with at least `minPlayers` of the characters in the group.
-export function teamRuns(report, characters, minPlayers) {
+// Every Mythic+ fight in a report, with its players and which of them are in the roster.
+export function keystoneFights(report, characters) {
   const team = characters.map((c) => ({ name: c.name, n: norm(c.name), s: norm(c.realm) }));
   const actors = new Map((report.masterData?.actors ?? []).map((a) => [a.id, a]));
   return (report.fights ?? [])
-    // Skip keys still being played (live logging); they are picked up once finished.
-    .filter((f) => f.keystoneLevel > 0 && !f.inProgress)
+    .filter((f) => f.keystoneLevel > 0)
     .map((f) => {
       const players = (f.friendlyPlayers ?? []).map((id, i) => {
         const a = actors.get(id);
@@ -193,8 +192,14 @@ export function teamRuns(report, characters, minPlayers) {
         return { actorId: id, name: a.name, className: a.subType ?? "", spec: f.friendlySpecs?.[i] ?? "", team: !!member };
       }).filter(Boolean);
       return { report, fight: f, players };
-    })
-    .filter((r) => r.players.filter((p) => p.team).length >= minPlayers);
+    });
+}
+
+// Mythic+ runs in a report with at least `minPlayers` of the characters in the group.
+// Keys still being played (live logging) are skipped; they are picked up once finished.
+export function teamRuns(report, characters, minPlayers) {
+  return keystoneFights(report, characters)
+    .filter((r) => !r.fight.inProgress && r.players.filter((p) => p.team).length >= minPlayers);
 }
 
 // Damage, healing and deaths for one run.
