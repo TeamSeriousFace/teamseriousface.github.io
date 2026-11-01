@@ -1,7 +1,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-app.js";
 import {
   getFirestore, collection, doc, onSnapshot, query, where,
-  addDoc, setDoc, updateDoc, deleteDoc, getDoc, serverTimestamp,
+  addDoc, setDoc, updateDoc, deleteDoc, getDoc, serverTimestamp, runTransaction,
 } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
 import {
   getAuth, onAuthStateChanged, signInWithPopup, signOut, GoogleAuthProvider,
@@ -56,7 +56,7 @@ const state = {
   runs: [],             // imported Warcraft Logs runs, newest first
   discordWebhook: "",   // where new runs are announced (config/discord), "" = off
   // day: selected day tab in the shown week (null = today, or the latest day with runs)
-  logs: { meta: null, metaLoaded: false, busy: false, status: "", notice: "", error: "", open: null, day: null, lastAttempt: 0 },
+  logs: { meta: null, metaLoaded: false, runsLoaded: false, busy: false, status: "", notice: "", error: "", open: null, day: null, lastAttempt: 0 },
   me: localStorage.getItem("me") || "",
   weekStart: mondayOf(new Date()),
   unsubAvailability: null,
@@ -161,6 +161,7 @@ onAuthStateChanged(auth, (user) => {
   unsubDiscord?.();
   state.unsubAvailability?.();
   unsubPlayers = unsubLates = unsubRuns = unsubLogsMeta = unsubDiscord = state.unsubAvailability = null;
+  Object.assign(state.logs, { metaLoaded: false, runsLoaded: false, discordLoaded: false });
   if (!user) {
     if ($("#signin-error").hidden) showSignin();
     return;
@@ -183,7 +184,9 @@ onAuthStateChanged(auth, (user) => {
   });
   unsubRuns = onSnapshot(collection(db, "runs"), (snap) => {
     state.runs = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.startedAt - a.startedAt);
+    state.logs.runsLoaded = true;
     renderLogs();
+    maybeAutoRefreshLogs();
   }, (err) => {
     console.error("Could not load runs:", err);
     state.logs.error = "Couldn't load team runs. Are the latest Firestore rules published?";
@@ -198,8 +201,14 @@ onAuthStateChanged(auth, (user) => {
   // Discord webhook for run announcements. Members-only data, never in the code or the repo.
   unsubDiscord = onSnapshot(doc(db, "config", "discord"), (snap) => {
     state.discordWebhook = snap.exists() ? snap.data().webhookUrl : "";
+    state.logs.discordLoaded = true;
     renderLogs();
-  }, (err) => console.error("Could not load Discord settings:", err));
+    maybeAutoRefreshLogs();
+  }, (err) => {
+    console.error("Could not load Discord settings:", err);
+    state.logs.discordLoaded = true; // check for runs anyway, just without posting
+    maybeAutoRefreshLogs();
+  });
   subscribeWeek();
   loadDungeons();
 });
@@ -1006,12 +1015,19 @@ function uniqueRuns(runs) {
 
 // Finds runs with at least MIN_TEAM_IN_RUN roster characters and saves new ones for everyone.
 // With `code`, only that report is checked (for pasted links, e.g. unlisted logs).
-async function refreshLogs({ code } = {}) {
+async function refreshLogs({ code, auto = false } = {}) {
   const logs = state.logs;
   if (logs.busy) return;
   Object.assign(logs, { busy: true, error: "", notice: "", status: code ? "Reading the log…" : "Looking for new team runs…" });
   renderLogs();
   try {
+    // Without the saved runs every run looks new, and would be saved and posted again.
+    if (!logs.runsLoaded || !logs.discordLoaded) throw new Error("Still loading, try again in a moment.");
+    // Only one browser checks at a time, or two open pages could both post the same new run.
+    if (!(await claimLogsCheck(auto ? LOGS_AUTO_REFRESH_MINUTES * 60000 : CHECK_TAKES_MS))) {
+      if (auto) return;
+      throw new Error(`${logs.meta?.byName || "Someone"} checked for runs less than a minute ago. Try again in a minute.`);
+    }
     const chars = state.players.map((p) => ({ name: p.name, realm: p.realm, realmSlug: slug(p.realm), region: p.region }));
     if (chars.length < MIN_TEAM_IN_RUN) throw new Error(`Add at least ${MIN_TEAM_IN_RUN} characters to the roster first.`);
     const codes = code ? [code] : await wcl.recentTeamReportCodes(chars, MIN_TEAM_IN_RUN);
@@ -1074,7 +1090,6 @@ async function refreshLogs({ code } = {}) {
         logs.error = `Saved the run, but couldn't post it to Discord: ${e.message}`;
       }
     }
-    if (!code) await setDoc(doc(db, "meta", "logs"), { lastRefresh: serverTimestamp(), byName: myDisplayName() });
     // A pasted link also shows every key in that log and why it was or wasn't saved.
     if (code) {
       const saved = [...state.runs, ...savedNow].filter((r) => !replacedIds.has(r.id));
@@ -1093,20 +1108,34 @@ async function refreshLogs({ code } = {}) {
   }
 }
 
+// Marks in meta/logs that this browser is checking now, unless another one started less than
+// `minAgeMs` ago. A transaction, so two browsers can never both get the go-ahead.
+const CHECK_TAKES_MS = 60000;
+function claimLogsCheck(minAgeMs) {
+  const ref = doc(db, "meta", "logs");
+  return runTransaction(db, async (tx) => {
+    const last = (await tx.get(ref)).data()?.lastRefresh?.toDate?.();
+    if (last && Date.now() - last.getTime() < minAgeMs) return false;
+    tx.set(ref, { lastRefresh: serverTimestamp(), byName: myDisplayName() });
+    return true;
+  });
+}
+
 // One connected member's browser keeps the shared list fresh; everyone else just reads it.
 // Called on load, when data arrives and every minute while the page is open. The last check is
 // shared through meta/logs, so a browser skips it when someone else checked recently.
 function maybeAutoRefreshLogs() {
   const logs = state.logs;
   if (!state.user || logs.busy || !wcl.isConfigured() || !wcl.isConnected()) return;
-  if (!logs.metaLoaded || state.players.length < MIN_TEAM_IN_RUN) return;
+  if (!logs.metaLoaded || !logs.runsLoaded || !logs.discordLoaded || state.players.length < MIN_TEAM_IN_RUN) return;
   const interval = LOGS_AUTO_REFRESH_MINUTES * 60000;
   if (!logs.justConnected && Date.now() - (logs.lastAttempt ?? 0) < interval) return; // also after errors
   const last = logs.meta?.lastRefresh?.toDate?.();
   if (logs.justConnected || !last || Date.now() - last.getTime() > interval) {
+    const auto = !logs.justConnected;
     logs.lastAttempt = Date.now();
     logs.justConnected = false;
-    refreshLogs();
+    refreshLogs({ auto });
   }
 }
 setInterval(maybeAutoRefreshLogs, 60000);
